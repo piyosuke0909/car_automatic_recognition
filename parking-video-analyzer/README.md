@@ -31,6 +31,7 @@ python src/main.py
 ```text
 output/analysis_result.json
 output/annotated_video.mp4
+output/tuning_report.json
 ```
 
 `analysis_result.json` には以下を出力します。
@@ -38,6 +39,8 @@ output/annotated_video.mp4
 - `vehicles`: 車両ごとのID、ラベル、検出開始フレーム、最終検出フレーム、移動経路
 - `frames`: フレームごとの検出結果、bbox、中心点、信頼度、エリアID、エリア別車両数
 - `areas`: エリアごとの平均車両数、最大車両数、混雑スコア、heatLevel
+
+`tuning_report.json` には confidence、bboxサイズ、フレームごとの検出数、追跡IDの寿命分布、現在の調整パラメータを出力します。
 
 ## JSON形式
 
@@ -69,6 +72,10 @@ congestionScore = averageCarCount * 10 + maxCarCount * 5
 ## 実装メモ
 
 - 検出対象は `car`, `truck`, `bus` です。
+- 暫定対応として、俯瞰映像で `cell phone` と誤認識される車両を `car` 扱いにしています。
+- 画面全体推論に加えて、2行x3列の分割推論を行います。
+- 重複検出はIoUベースのNMSで統合します。
+- 小さすぎる/大きすぎるbboxはサイズフィルタで除外します。
 - 追跡は中心点距離ベースの簡易実装です。
 - エリア判定は画像座標で行います。
 - 初期状態では画面を横3列、縦2行に分割します。

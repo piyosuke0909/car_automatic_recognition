@@ -1,45 +1,55 @@
+import argparse
 import sys
+from pathlib import Path
+from time import perf_counter
 
 import cv2
 
+from analysis_reporter import write_tuning_report
 from area_analyzer import AreaAnalyzer
 from config import (
-    AREA_COLUMNS,
     AREA_LINE_COLOR,
-    AREA_ROWS,
     AREA_TEXT_COLOR,
     BOX_COLOR,
-    CONFIDENCE_THRESHOLD,
     DEFAULT_FPS,
-    INPUT_VIDEO_PATH,
-    INPUT_VIDEO_RELATIVE,
-    OUTPUT_DIR,
-    OUTPUT_JSON_PATH,
-    OUTPUT_VIDEO_PATH,
-    PROGRESS_INTERVAL_FRAMES,
-    TARGET_LABELS,
     TEXT_BG_COLOR,
     TEXT_COLOR,
-    TRACK_MAX_DISTANCE,
-    TRACK_MAX_MISSED_FRAMES,
-    YOLO_MODEL_NAME,
+    available_profiles,
+    load_profile,
+    selected_parameters,
 )
 from json_exporter import export_analysis
+from performance_reporter import write_performance_report
 from route_analyzer import RouteAnalyzer
 from vehicle_detector import VehicleDetector
 from vehicle_tracker import VehicleTracker
 
 
-def main():
-    if not INPUT_VIDEO_PATH.exists():
-        print(f"Input video not found: {INPUT_VIDEO_PATH}", file=sys.stderr)
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        profile = load_profile(
+            args.profile,
+            model_override=args.model,
+            disable_label_aliases=args.disable_label_aliases,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    if args.output_dir:
+        apply_output_dir(profile, args.output_dir)
+
+    input_video_path = profile["input_video_path"]
+    if not input_video_path.exists():
+        print(f"Input video not found: {input_video_path}", file=sys.stderr)
         return 1
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    profile["output_json_path"].parent.mkdir(parents=True, exist_ok=True)
 
-    capture = cv2.VideoCapture(str(INPUT_VIDEO_PATH))
+    capture = cv2.VideoCapture(to_opencv_path(input_video_path))
     if not capture.isOpened():
-        print(f"Failed to open input video: {INPUT_VIDEO_PATH}", file=sys.stderr)
+        print(f"Failed to open input video: {input_video_path}", file=sys.stderr)
         return 1
 
     fps = capture.get(cv2.CAP_PROP_FPS) or DEFAULT_FPS
@@ -53,36 +63,78 @@ def main():
         capture.release()
         return 1
 
-    writer = create_video_writer(OUTPUT_VIDEO_PATH, fps, width, height)
-    if not writer.isOpened():
-        print(f"Failed to open output video: {OUTPUT_VIDEO_PATH}", file=sys.stderr)
-        capture.release()
-        return 1
+    writer = None
+    if not args.skip_video_output:
+        writer = create_video_writer(profile["output_video_path"], fps, width, height)
+        if not writer.isOpened():
+            print(
+                f"Warning: failed to open output video, continuing without video: "
+                f"{profile['output_video_path']}",
+                file=sys.stderr,
+            )
+            writer = None
 
-    detector = VehicleDetector(YOLO_MODEL_NAME, TARGET_LABELS, CONFIDENCE_THRESHOLD)
-    tracker = VehicleTracker(TRACK_MAX_DISTANCE, TRACK_MAX_MISSED_FRAMES)
-    area_analyzer = AreaAnalyzer(width, height, AREA_ROWS, AREA_COLUMNS)
+    detector = VehicleDetector(
+        profile["yolo_model_name"],
+        profile["target_labels"],
+        profile["confidence_threshold"],
+        profile["label_aliases"],
+        profile["yolo_image_size"],
+        profile["bbox_filter"],
+        profile["enable_full_frame_detection"],
+        profile["enable_tiled_detection"],
+        profile["tile_rows"],
+        profile["tile_columns"],
+        profile["tile_overlap_pixels"],
+        profile["nms_iou_threshold"],
+    )
+    tracker = VehicleTracker(
+        profile["track_max_distance"],
+        profile["track_max_missed_frames"],
+    )
+    area_analyzer = AreaAnalyzer(
+        width,
+        height,
+        profile["area_rows"],
+        profile["area_columns"],
+    )
     route_analyzer = RouteAnalyzer()
 
     frames = []
     area_count_history = []
+    frame_timings = []
     frame_index = 0
+    run_started_at = perf_counter()
+
+    print(f"Profile: {profile['name']}")
+    print(f"Model: {profile['yolo_model_name']}")
 
     try:
         while True:
+            if args.max_frames and frame_index >= args.max_frames:
+                break
+
             ok, frame = capture.read()
             if not ok:
                 break
 
+            frame_started_at = perf_counter()
+            detection_started_at = perf_counter()
             detections = detector.detect(frame)
-            tracked_detections = tracker.update(detections, frame_index)
+            detection_seconds = perf_counter() - detection_started_at
 
+            tracking_started_at = perf_counter()
+            tracked_detections = tracker.update(detections, frame_index)
+            tracking_seconds = perf_counter() - tracking_started_at
+
+            area_route_started_at = perf_counter()
             for detection in tracked_detections:
                 detection["areaId"] = area_analyzer.get_area_id(detection["center"])
 
             area_counts = area_analyzer.count_by_area(tracked_detections)
             area_count_history.append(area_counts)
             route_analyzer.update(frame_index, tracked_detections)
+            area_route_seconds = perf_counter() - area_route_started_at
 
             frames.append(
                 {
@@ -93,25 +145,43 @@ def main():
                 }
             )
 
-            annotated_frame = frame.copy()
-            draw_areas(annotated_frame, area_analyzer.areas, area_counts)
-            draw_detections(annotated_frame, tracked_detections)
-            writer.write(annotated_frame)
+            draw_write_started_at = perf_counter()
+            if writer is not None:
+                annotated_frame = frame.copy()
+                draw_areas(annotated_frame, area_analyzer.areas, area_counts)
+                draw_detections(annotated_frame, tracked_detections)
+                writer.write(annotated_frame)
+            draw_write_seconds = perf_counter() - draw_write_started_at
+            frame_total_seconds = perf_counter() - frame_started_at
+
+            frame_timings.append(
+                {
+                    "frameIndex": int(frame_index),
+                    "detectionCount": len(tracked_detections),
+                    "frame_total_seconds": round(frame_total_seconds, 6),
+                    "detection_seconds": round(detection_seconds, 6),
+                    "tracking_seconds": round(tracking_seconds, 6),
+                    "area_route_seconds": round(area_route_seconds, 6),
+                    "draw_write_seconds": round(draw_write_seconds, 6),
+                }
+            )
 
             frame_index += 1
-            if frame_index % PROGRESS_INTERVAL_FRAMES == 0:
+            if frame_index % profile["progress_interval_frames"] == 0:
                 print(f"Processed {frame_index} frames")
     finally:
         capture.release()
-        writer.release()
+        if writer is not None:
+            writer.release()
 
+    total_wall_seconds = perf_counter() - run_started_at
     vehicles = route_analyzer.build_vehicles()
     areas = area_analyzer.summarize(area_count_history)
     duration = frame_index / fps if fps else 0
 
-    export_analysis(
-        output_path=OUTPUT_JSON_PATH,
-        video_file=INPUT_VIDEO_RELATIVE,
+    analysis_result = export_analysis(
+        output_path=profile["output_json_path"],
+        video_file=profile["input_video_relative"],
         fps=fps,
         frame_count=frame_index,
         duration=duration,
@@ -119,16 +189,90 @@ def main():
         frames=frames,
         areas=areas,
     )
+    parameters = selected_parameters(profile)
+    write_tuning_report(
+        profile["output_tuning_report_path"],
+        analysis_result,
+        parameters,
+    )
+    write_performance_report(
+        profile["output_performance_report_path"],
+        analysis_result,
+        parameters,
+        frame_timings,
+        total_wall_seconds,
+    )
 
-    print(f"Analysis JSON: {OUTPUT_JSON_PATH}")
-    print(f"Annotated video: {OUTPUT_VIDEO_PATH}")
+    print(f"Analysis JSON: {profile['output_json_path']}")
+    print(f"Tuning report: {profile['output_tuning_report_path']}")
+    print(f"Performance report: {profile['output_performance_report_path']}")
+    if writer is not None:
+        print(f"Annotated video: {profile['output_video_path']}")
+    else:
+        print("Annotated video: skipped")
     print(f"Processed frames: {frame_index}")
     return 0
 
 
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description="Analyze parking-lot video.")
+    parser.add_argument(
+        "--profile",
+        choices=available_profiles(),
+        default="default",
+        help="Runtime configuration profile.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Override the YOLO model path/name for the selected profile.",
+    )
+    parser.add_argument(
+        "--disable-label-aliases",
+        action="store_true",
+        help="Disable temporary label aliases such as cell phone -> car.",
+    )
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=0,
+        help="Stop after this many frames. 0 means process the full video.",
+    )
+    parser.add_argument(
+        "--skip-video-output",
+        action="store_true",
+        help="Skip annotated video writing and only generate JSON reports.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Override output directory. Relative paths are resolved from the current directory.",
+    )
+    return parser.parse_args(argv)
+
+
+def apply_output_dir(profile, output_dir):
+    output_dir = Path(output_dir)
+    if not output_dir.is_absolute():
+        output_dir = Path.cwd() / output_dir
+
+    profile["output_json_path"] = output_dir / "analysis_result.json"
+    profile["output_video_path"] = output_dir / "annotated_video.mp4"
+    profile["output_tuning_report_path"] = output_dir / "tuning_report.json"
+    profile["output_performance_report_path"] = output_dir / "performance_report.json"
+
+
 def create_video_writer(path, fps, width, height):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    return cv2.VideoWriter(str(path), fourcc, fps, (width, height))
+    return cv2.VideoWriter(to_opencv_path(path), fourcc, fps, (width, height))
+
+
+def to_opencv_path(path):
+    path = Path(path)
+    try:
+        return str(path.relative_to(Path.cwd()))
+    except ValueError:
+        return str(path)
 
 
 def draw_areas(frame, areas, area_counts):
