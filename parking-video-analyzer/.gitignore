@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+
+input/*.mp4
+output/*
+!output/.gitkeep
+
+yolov*.pt
+runs/
+*.log

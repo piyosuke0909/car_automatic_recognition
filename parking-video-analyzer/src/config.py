@@ -1,0 +1,29 @@
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+
+INPUT_VIDEO_RELATIVE = "input/parking_sample.mp4"
+INPUT_VIDEO_PATH = BASE_DIR / INPUT_VIDEO_RELATIVE
+
+OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_JSON_PATH = OUTPUT_DIR / "analysis_result.json"
+OUTPUT_VIDEO_PATH = OUTPUT_DIR / "annotated_video.mp4"
+
+YOLO_MODEL_NAME = "yolov8n.pt"
+TARGET_LABELS = {"car", "truck", "bus"}
+CONFIDENCE_THRESHOLD = 0.25
+
+AREA_ROWS = 2
+AREA_COLUMNS = 3
+
+TRACK_MAX_DISTANCE = 80.0
+TRACK_MAX_MISSED_FRAMES = 20
+
+DEFAULT_FPS = 30.0
+PROGRESS_INTERVAL_FRAMES = 100
+
+BOX_COLOR = (0, 255, 0)
+TEXT_COLOR = (255, 255, 255)
+TEXT_BG_COLOR = (0, 0, 0)
+AREA_LINE_COLOR = (255, 180, 0)
+AREA_TEXT_COLOR = (255, 255, 0)
